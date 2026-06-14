@@ -1,0 +1,314 @@
+#include <Wire.h>
+#include <Adafruit_BNO08x.h>
+#include <Adafruit_Sensor.h> // IMU센서 드라이버
+#include <ArduinoBLE.h>
+
+// ===== BNO08x =====
+Adafruit_BNO08x bno08x;// 센서 객체 정의
+sh2_SensorValue_t sensorValue;// 센서 데이터 저장용 구조체 정의
+
+// ===== BLE =====
+BLEService dataService("180C");// 서비스 UUID정의()
+BLECharacteristic dataChar("2A56", BLERead | BLENotify, 11); // 케릭터 UUID, 데이터 읽기와 자동전송이 11바이트 크기로 전송이 가능하도록 캐릭터 기능을 설정한다.
+
+// ===== Angle =====
+int angle1, angle2, angle3, angle4, angle5;
+
+// ===== IMU =====
+float roll, pitch, yaw;
+float yawOffset = 0;
+bool yawZeroSet = false;
+
+// yaw 평균용
+float yawSum = 0;
+int yawCount = 0;
+
+// ===== LED =====
+#define LED_PIN 10 // 켈리브레이션 중에 점등되도록 설정()
+// ===== 버튼 =====
+#define YAW_RESET_BTN 9 // yaw값 초기화 버튼
+
+// ===== 필터 =====
+float filtered[8] = {0};
+const float alpha = 0.3;
+
+// ===== 치팅 방지 =====
+int lastSent[8] = {0};
+const int THRESHOLD_ANGLE = 2;
+const int THRESHOLD_IMU   = 2;
+
+// ===== 초기 캘리브레이션 =====
+bool calibrated = false;
+unsigned long calibStartTime = 0;
+const unsigned long CALIB_TIME = 10000; // 10초간 실시
+int calibMin[5];
+int calibMax[5];
+
+// ===== 체크섬 =====
+uint8_t Checksum(uint8_t *data, int len) {
+  uint8_t cs = 0;
+  for (int i = 0; i < len; i++) cs ^= data[i];
+  return cs;
+}
+
+// ===================================================
+void BNO08x_Update() {
+
+  if (bno08x.getSensorEvent(&sensorValue)) {
+
+    if (sensorValue.sensorId == SH2_ROTATION_VECTOR) { // vector데이터만 처리하겠다.
+
+      float qw = sensorValue.un.rotationVector.real;
+      float qx = sensorValue.un.rotationVector.i;
+      float qy = sensorValue.un.rotationVector.j;
+      float qz = sensorValue.un.rotationVector.k;
+
+      roll  = atan2(2*(qw*qx + qy*qz), 1 - 2*(qx*qx + qy*qy)) * 180.0 / PI;
+      pitch = asin(2*(qw*qy - qz*qx)) * 180.0 / PI;
+
+      yaw = atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz)) * 180.0 / PI;
+
+      if (yaw > 180.0f)  yaw -= 360.0f;
+      if (yaw < -180.0f) yaw += 360.0f;
+    }
+  }
+}
+
+// ===================================================
+void autoCalibration() { // 켈리브레이션은 손가락 부분만 실시한다.
+
+  static bool init = false;
+
+  if (!init) { 
+    for (int i = 0; i < 5; i++) {
+      calibMin[i] = 1023;
+      calibMax[i] = 0;
+    }
+    calibStartTime = millis();
+    init = true;
+
+    digitalWrite(LED_PIN, HIGH);
+  }
+
+  int raw[5];
+  raw[0] = analogRead(A0);
+  raw[1] = analogRead(A1);
+  raw[2] = analogRead(A2);
+  raw[3] = analogRead(A3);
+  raw[4] = analogRead(A6);
+
+  for (int i = 0; i < 5; i++) {
+    if (raw[i] < calibMin[i]) calibMin[i] = raw[i];
+    if (raw[i] > calibMax[i]) calibMax[i] = raw[i];
+  }
+}
+
+// ===================================================
+void setup() {
+
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("START");
+  
+  Wire.begin();
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(YAW_RESET_BTN, INPUT_PULLUP);
+
+  // ===== BNO08x =====
+  if (!bno08x.begin_I2C()) {
+    Serial.println("BNO08x FAIL");
+    while (1);
+  }
+
+  bno08x.enableReport(SH2_ROTATION_VECTOR, 5000);
+  Serial.println("BNO08x OK");
+
+  // ===== BLE =====
+  if (!BLE.begin()) {
+    Serial.println("BLE FAIL");
+    while (1);
+  }
+
+  BLE.setLocalName("Nano33IMU"); // 해당 기기의 이름설정
+  BLE.setAdvertisedService(dataService);
+
+  dataService.addCharacteristic(dataChar);
+  BLE.addService(dataService);
+
+  dataChar.writeValue((byte)0);
+
+  BLE.advertise();
+  Serial.println("BLE Ready");
+}
+
+// ===================================================
+void loop() {
+
+  BLE.poll();
+
+  static BLEDevice central;
+
+  if (!central) {
+    central = BLE.central();
+  }
+
+  // ===== 캘리브레이션 =====
+  if (!calibrated) {
+    autoCalibration();
+
+    Serial.println("Calibrating...");
+    
+   if (millis() - calibStartTime > CALIB_TIME) {
+    calibrated = true;
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("Calibration Done");
+  }
+  delay(100);
+  return; // 현재 함수를 즉시 종료. 여기서는 loop()함수를 의미. if는 조건문이지 함수가 아니다!
+  }
+
+  // ===== 아날로그 =====
+  angle1 = map(constrain(analogRead(A0), calibMin[0], calibMax[0]), calibMin[0], calibMax[0], 0, 180);
+  angle2 = map(constrain(analogRead(A1), calibMin[1], calibMax[1]), calibMin[1], calibMax[1], 180, 0);
+  angle3 = map(constrain(analogRead(A2), calibMin[2], calibMax[2]), calibMin[2], calibMax[2], 180, 0);
+  angle4 = map(constrain(analogRead(A3), calibMin[3], calibMax[3]), calibMin[3], calibMax[3], 180, 0);
+  angle5 = map(constrain(analogRead(A6), calibMin[4], calibMax[4]), calibMin[4], calibMax[4], 180, 0);
+
+  // ===== IMU =====
+  BNO08x_Update();// IMU센서값을 갱신!
+
+  // ===== yaw 리셋 버튼 ===== // 버튼이 눌리는 순간 단 한번만 실행.
+  static bool lastBtnState = HIGH;
+  bool btnState = digitalRead(YAW_RESET_BTN);
+
+  if (lastBtnState == HIGH && btnState == LOW) { // 이전에는 안 눌렸는데, 지금 눌렸다.(옛지 트리거 방식)
+    yawOffset = yaw;
+    yawZeroSet = true;
+  }
+  lastBtnState = btnState; // 버튼을 때는 순간 high가 된다.(버튼핀이 풀업 저항이므로)ㅡ, 계속 누른 상태면 값이0이 유지됨으로 위의 if문이 실행되지 않는다. 즉 한번만 실행하는 기능을 구현.
+
+  // ===== 자동 offset ===== // 블루투스 연결직후 자동으로 yaw의 영점을 잡아주는 로직
+  static bool wasConnected = false;
+
+  if (central && central.connected()) { // 최초 한번 만 실행됨.
+
+    if (!wasConnected && !yawZeroSet) {
+      yawSum += yaw;
+      yawCount++;
+
+      if (yawCount > 20) { // 20번 모이면 평균을 계산.
+        yawOffset = yawSum / yawCount;
+        yawZeroSet = true;
+        wasConnected = true;
+        yawSum = 0;
+        yawCount = 0;
+      }
+    }
+
+  } else {
+    wasConnected = false;
+    yawSum = 0;
+    yawCount = 0;
+  }
+
+  // ===== yaw 계산 =====
+  float yawRelative = yaw - yawOffset;
+
+  if (yawRelative > 180.0f)  yawRelative -= 360.0f;
+  if (yawRelative < -180.0f) yawRelative += 360.0f;
+
+  uint8_t roll_i  = constrain(roll, -90, 90) + 90;
+  uint8_t pitch_i = constrain(pitch, -90, 90) + 90;
+  uint8_t yaw_i   = 180 - constrain(yawRelative + 90, 0, 180);
+
+  // ===== current 배열 =====
+  int current[8] = {
+    angle1, angle2, angle3, angle4, angle5,
+    roll_i, pitch_i, yaw_i
+  };
+
+  // ===== EMA 필터 =====(이전 값 + 현재 값을 섞어서 부드럽게 만드는 필터)
+ for (int i = 0; i < 8; i++) {
+    filtered[i] = alpha * current[i] + (1 - alpha) * filtered[i]; // current : 지금센서값, filtered : 이전에 계산된 값, alpha : 현재값을 얼마나 믿을지
+  }
+
+  // ===== BLE 전송 =====
+  if (central && central.connected()) {
+
+    bool sendFlag = false;
+
+    for (int i = 0; i < 8; i++) {
+      int threshold = (i < 5) ? THRESHOLD_ANGLE : THRESHOLD_IMU;// 3항 연산자(조건 ? 참일때 값 : 거짓일때 값)
+
+      if (abs((int)filtered[i] - lastSent[i]) >= threshold) { // 조건식 비교할때만 잠깐 int로 변환하여 비교 계산.
+        sendFlag = true;
+        break; // for함수를 즉시 탈출, 하나라도 임계값 이상의 데이터가 있으면 데이터를 전송
+      }
+    }
+
+    if (sendFlag) {
+
+      uint8_t packet[11];
+      packet[0] = 0x02; // 스타트 비트
+
+      for (int i = 0; i < 8; i++) {
+        packet[i + 1] = (uint8_t)filtered[i]; // float함수를 8비트 함수로바꾸어서 패킷에 저장. (type)형태는 형변환을 지시하는 코드이다.(일시적),임시값을 즉각 폐기된다.
+      }
+
+      packet[9] = Checksum(&packet[1], 8);
+      packet[10] = 0x03;
+
+      dataChar.writeValue(packet, 11);// ble데이터 송신
+
+      for (int i = 0; i < 8; i++) {
+        lastSent[i] = (int)filtered[i];
+      }
+    }
+  }
+
+/* 오리지널 센서값 시리얼 출력
+Serial.print("A: ");
+Serial.print(angle1); Serial.print(" ");
+Serial.print(angle2); Serial.print(" ");
+Serial.print(angle3); Serial.print(" ");
+Serial.print(angle4); Serial.print(" ");
+Serial.print(angle5);
+
+Serial.print(" | IMU: ");
+Serial.print("R "); Serial.print(roll_i);
+Serial.print(" P "); Serial.print(pitch_i);
+Serial.print(" Y "); Serial.println(yaw_i);
+*/
+
+// 필터출력 값 시리얼 출력
+Serial.print("F: ");
+Serial.print((int)filtered[0]); Serial.print(" ");
+Serial.print((int)filtered[1]); Serial.print(" ");
+Serial.print((int)filtered[2]); Serial.print(" ");
+Serial.print((int)filtered[3]); Serial.print(" ");
+Serial.print((int)filtered[4]);
+
+Serial.print(" | IMU: ");
+Serial.print("R "); Serial.print((int)filtered[5]);
+Serial.print(" P "); Serial.print((int)filtered[6]);
+Serial.print(" Y "); Serial.println((int)filtered[7]);
+
+  delay(5);
+}
+
+
+
+/*송신측에도 EMA를 집어넣는 이유
+IMU + 가변저항 -> 값을 생성
+손의 미세한 흔들림과 전원의 흔들림 뿐만아니라 ADC자체 해상도의 한계등으로 인해서 각도값이 +- 1 ~ 5도 정도 계속 흔들린다 이는 각도가 완전한 고정이 되지 않아 지터의 원인이 된다.
+뿐만 아니라 BLE전송 과정에서 발생되는 패킷 손실 및 전송 타이밍 불규칙 또한 지터의 원인이된다.
+
+따라서 필요한 작업은
+
+<송신측> 
+노이즈 제거(EMA)
+불필요한 데이터 차단(threshold)
+
+<수신측>
+서보모터 움직임을 부드럽게하기 위해서 속도제한 코드를 삽입할것 */
