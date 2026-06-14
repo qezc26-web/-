@@ -1,0 +1,189 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <ArduinoBLE.h>
+
+// ===== PCA9685 =====
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(); // 서보모터드라이버 객체 생성(기본 주소 0x40)
+
+#define SERVOMIN 110 //최소각 0도
+#define SERVOMAX 490 //최대각 180도
+
+// ===== BLE =====
+BLEDevice peripheral;
+BLECharacteristic dataChar;
+
+// ===== Packet =====
+uint8_t rxBuf[20]; // ble에서 받은 원본데이터 저장
+uint8_t packetBuf[11]; // 완성된 패킷 저장
+int packetIndex = 0; // 몇 바이트 받았는지 확인용
+
+// ===== Angle =====
+int targetAngle[8]  = {90,90,90,90,90,90,90,90};
+float currentAngle[8] = {90,90,90,90,90,90,90,90};
+
+// ===== Servo Speed =====
+float step = 2.5;   // 🔥 속도 조절 핵심
+
+// ===== Debug =====
+unsigned long lastDebug = 0; // 100ms마다 출력하기 위한 시간저장
+
+// ===== Checksum =====
+uint8_t calcChecksum(uint8_t *data, int len) {
+  uint8_t cs = 0;
+  for (int i = 0; i < len; i++) cs ^= data[i];
+  return cs;
+}
+
+// ===== 각도 → PWM =====
+int angleToPWM(int ang) {
+  return map(ang, 0, 180, SERVOMIN, SERVOMAX);
+}
+
+// ===================================================
+void setup() {
+
+  Serial.begin(115200);
+  delay (5000);
+
+  Wire.begin();//I2C통신시작
+  Wire.setClock(400000); //I2C 통신속도를 400kHz로 설정(최대값)
+
+  pwm.begin();//PCA9865통신시작
+  pwm.setPWMFreq(50);//서보모터 제어주기 50hz
+
+  if (!BLE.begin()) {
+    Serial.println("BLE FAIL");
+    while (1);
+  }
+
+  BLE.scanForName("Nano33IMU");// 송신측과 이름이 일치해야지만 연결된다 and 주변 BLE장치를 검색(Nano33IMU 찾을 때까지 계속 스캔)
+  Serial.println("Scanning...");
+}
+
+// ===================================================
+void loop() {
+
+  BLE.poll(); //BLE이벤트 처리(무선으로 들어온 데이터(연결정보, 전송데이터 등등...)를 가져와서 내부 버퍼에 저장)
+
+  // ===== 연결 =====
+  if (!peripheral) { // ble객체가 연결이 안되있으면
+
+    peripheral = BLE.available(); // poll함수로 내부저장소에 저장된 객체 정보를 활성화
+
+    if (peripheral) { // ble객체가 연결되면
+
+      Serial.println("Found device");
+      BLE.stopScan(); // 스캔을 종료
+
+      if (peripheral.connect()) { //생성된 객체의 데이터 통신 채널 생성
+
+        Serial.println("Connected");
+
+        if (peripheral.discoverAttributes()) { // 해당객체안에 있는 모든 서비스와 characteristic 구조를 읽어라
+                                               //(즉. 해당객체(장치)안에 어떤 서비스가 있는지 확인하라는 뜻)
+                                               //해당 함수를 사용하지 않으면 .characteristic가 활성화 되지 않음.
+          dataChar = peripheral.characteristic("2A56"); // 연결된 장치에서 UUID가 2A56인 characteristic(데이터 통로)을 가져온다. 
+
+          if (dataChar) { // characteristic이 정상적으로 잡히면
+            dataChar.subscribe(); // 데이터에 변동이 있으면 자동으로 데이터를 송신할것(구독)
+            Serial.println("Subscribed");
+          }
+        }
+      }
+    }
+  }
+
+  // ===== 데이터 수신 =====
+  if (peripheral && peripheral.connected()) { // 객체(장치)가 존재하고, 실제 연결상태일경우,
+  //if (peripheral.connected())만 사용하면 오류가 발생할 가능성이 있기때문에 정석은 2개의 조건을 모두 체크한다.
+
+    if (dataChar.valueUpdated()) { // 새로운 BLE notify 데이터가 도착했다면
+
+      int len = dataChar.readValue(rxBuf, sizeof(rxBuf)); // BLE 내부 버퍼 → rxBuf[]로 복사
+
+      for (int i = 0; i < len; i++) {
+
+        uint8_t b = rxBuf[i];
+
+        // START
+        if (packetIndex == 0) {
+          if (b == 0x02) {
+            packetBuf[packetIndex++] = b;
+          }
+          continue; // for함수 안에서만 사용되며, for함수를 그 즉시 탈출한다.
+        }
+
+        // 저장
+        packetBuf[packetIndex++] = b;
+
+        // 패킷 완성
+        if (packetIndex == 11) {
+
+          if (packetBuf[10] == 0x03) {
+
+            uint8_t cs = calcChecksum(&packetBuf[1], 8);
+
+            if (cs == packetBuf[9]) {
+
+              // ===== 목표값 업데이트 =====
+              for (int j = 0; j < 8; j++) {
+                targetAngle[j] = packetBuf[j + 1]; // 패킷데이터를 타켓엥글에 대입.
+              }
+            }
+          }
+
+          packetIndex = 0;
+        }
+
+        if (packetIndex >= 11) {
+          packetIndex = 0;
+        }
+      }
+    }
+  }
+
+  // ===== 서보 부드럽게 이동 (핵심) =====
+  for (int i = 0; i < 8; i++) {
+
+    float diff = targetAngle[i] - currentAngle[i];
+
+    if (abs(diff) > step) {
+      currentAngle[i] += (diff > 0) ? step : -step; // 목표가 더 크면 +step, 목표가 더 작으면 -step
+    } else {
+      currentAngle[i] = targetAngle[i];
+    }
+
+    pwm.setPWM(i, 0, angleToPWM((int)currentAngle[i])); //pwn 제어(서보모터에 동작지시)
+  }
+
+  // ===== 디버그 ===== // 100ms마다 목표값(T)와 현재각(C)를 출력한다.
+  /*delay()를 사용하는 동안은 코드가 정지되기 때문에 ble나 서보모터가 일시적으로 멈추게 된다. 이러한 문제점을 해결하기 위해서 millis방식을 사용.
+  Serial출력은 생각보다 무겁기 때문에 너무 빨리 출력하면 과부하로 프로그램이 정지해버리고, 너무 느리면 변화를 체크하기 힘들기 때문에 적절한 주기로 시리얼을 출력시킨다.
+  */
+  if (millis() - lastDebug > 100) {
+    lastDebug = millis();
+
+    Serial.print("T: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.print(targetAngle[i]);
+      Serial.print(" ");
+    }
+
+    Serial.print("| C: ");
+    for (int i = 0; i < 8; i++) {
+      Serial.print((int)currentAngle[i]);
+      Serial.print(" ");
+    }
+
+    Serial.println();
+  }
+
+  // ===== 재연결 =====
+  if (peripheral && !peripheral.connected()) { // 객체와의 연결이 끊킨경우
+    Serial.println("Disconnected");
+    peripheral = BLEDevice(); // peripheral 객체를 “빈 상태(초기 상태)”로 초기화한다
+    BLE.scanForName("Nano33IMU"); // 재검색 시작
+  }
+
+  delay(5);
+}
